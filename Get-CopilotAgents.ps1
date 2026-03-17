@@ -37,6 +37,19 @@ function Get-PlainToken {
     return $TokenResult.Token
 }
 
+# Helper: safely extract error details from an ErrorRecord (immune to StrictMode leaking from modules)
+function Get-ErrorDetail {
+    param([object]$ErrorRecord)
+    $code = $null
+    $msg = $null
+    try { $code = $ErrorRecord.Exception.Response.StatusCode.value__ } catch {}
+    try { $msg = $ErrorRecord.ErrorDetails.Message } catch {}
+    if (-not $msg) {
+        try { $msg = $ErrorRecord.Exception.Message } catch { $msg = "$ErrorRecord" }
+    }
+    return @{ StatusCode = $code; Detail = $msg }
+}
+
 # Normalize the environment URL (remove trailing slash)
 $EnvironmentUrl = $EnvironmentUrl.TrimEnd('/')
 
@@ -84,9 +97,8 @@ while ($requestUrl) {
         $response = Invoke-RestMethod -Uri $requestUrl -Headers $headers -Method Get
     }
     catch {
-        $statusCode = $_.Exception.Response.StatusCode.value__
-        $detail = if ($_.ErrorDetails.Message) { $_.ErrorDetails.Message } else { $_.Exception.Message }
-        Write-Error "Dataverse API request failed (HTTP $statusCode). $detail"
+        $err = Get-ErrorDetail $_
+        Write-Error "Dataverse API request failed (HTTP $($err.StatusCode)). $($err.Detail)"
         exit 1
     }
 

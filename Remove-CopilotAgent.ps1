@@ -64,6 +64,19 @@ function Get-PlainToken {
     return $TokenResult.Token
 }
 
+# Helper: safely extract error details from an ErrorRecord (immune to StrictMode leaking from modules)
+function Get-ErrorDetail {
+    param([object]$ErrorRecord)
+    $code = $null
+    $msg = $null
+    try { $code = $ErrorRecord.Exception.Response.StatusCode.value__ } catch {}
+    try { $msg = $ErrorRecord.ErrorDetails.Message } catch {}
+    if (-not $msg) {
+        try { $msg = $ErrorRecord.Exception.Message } catch { $msg = "$ErrorRecord" }
+    }
+    return @{ StatusCode = $code; Detail = $msg }
+}
+
 # Normalize the environment URL (remove trailing slash)
 $EnvironmentUrl = $EnvironmentUrl.TrimEnd('/')
 
@@ -111,9 +124,8 @@ if ($PSCmdlet.ParameterSetName -eq 'ByName') {
         $lookupResponse = Invoke-RestMethod -Uri $lookupUrl -Headers $dataverseHeaders -Method Get
     }
     catch {
-        $statusCode = $_.Exception.Response.StatusCode.value__
-        $detail = if ($_.ErrorDetails.Message) { $_.ErrorDetails.Message } else { $_.Exception.Message }
-        Write-Error "Failed to query bots (HTTP $statusCode). $detail"
+        $err = Get-ErrorDetail $_
+        Write-Error "Failed to query bots (HTTP $($err.StatusCode)). $($err.Detail)"
         exit 1
     }
 
@@ -143,13 +155,12 @@ else {
         $botDetails = Invoke-RestMethod -Uri $detailUrl -Headers $dataverseHeaders -Method Get
     }
     catch {
-        $statusCode = $_.Exception.Response.StatusCode.value__
-        if ($statusCode -eq 404) {
+        $err = Get-ErrorDetail $_
+        if ($err.StatusCode -eq 404) {
             Write-Error "No bot found with ID '$BotId' in environment '$EnvironmentUrl'."
             exit 1
         }
-        $detail = if ($_.ErrorDetails.Message) { $_.ErrorDetails.Message } else { $_.Exception.Message }
-        Write-Error "Failed to query bot (HTTP $statusCode). $detail"
+        Write-Error "Failed to query bot (HTTP $($err.StatusCode)). $($err.Detail)"
         exit 1
     }
 }
@@ -212,11 +223,8 @@ if ($EnvironmentId) {
         Write-Host "Bot '$($botDetails.name)' ($BotId) deleted successfully via Admin API." -ForegroundColor Green
     }
     catch {
-        $statusCode = $null
-        if ($_.Exception.Response) {
-            $statusCode = $_.Exception.Response.StatusCode.value__
-        }
-        Write-Warning "Admin API deletion failed (HTTP $statusCode). Falling back to Dataverse PvaDeleteBot action..."
+        $err = Get-ErrorDetail $_
+        Write-Warning "Admin API deletion failed (HTTP $($err.StatusCode)). Falling back to Dataverse PvaDeleteBot action..."
     }
 }
 else {
@@ -235,9 +243,8 @@ if (-not $deleted) {
         Write-Host "Bot '$($botDetails.name)' ($BotId) deleted successfully via PvaDeleteBot." -ForegroundColor Green
     }
     catch {
-        $statusCode = $_.Exception.Response.StatusCode.value__
-        $detail = if ($_.ErrorDetails.Message) { $_.ErrorDetails.Message } else { $_.Exception.Message }
-        Write-Error "PvaDeleteBot failed (HTTP $statusCode). $detail"
+        $err = Get-ErrorDetail $_
+        Write-Error "PvaDeleteBot failed (HTTP $($err.StatusCode)). $($err.Detail)"
         exit 1
     }
 }
