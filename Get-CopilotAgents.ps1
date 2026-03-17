@@ -86,9 +86,8 @@ $headers = @{
     "OData-Version" = "4.0"
 }
 
-# --- Query Bots with Pagination ---
-$selectFields = "botid,name,schemaname,statecode,statuscode,language,createdon,modifiedon"
-$requestUrl = "$EnvironmentUrl/api/data/v9.2/bots?`$select=$selectFields&`$orderby=name"
+# --- Query Bots with Pagination (no $select — retrieve all fields) ---
+$requestUrl = "$EnvironmentUrl/api/data/v9.2/bots?`$orderby=name"
 
 $allBots = [System.Collections.Generic.List[PSObject]]::new()
 
@@ -112,6 +111,14 @@ while ($requestUrl) {
 
     # Follow pagination link if present
     $requestUrl = $response.'@odata.nextLink'
+}
+
+# Dump all property names from the first bot for diagnostics
+if ($allBots.Count -gt 0) {
+    $propNames = ($allBots[0] | Get-Member -MemberType NoteProperty).Name | Where-Object { $_ -notlike '@odata*' }
+    Write-Host "`nDataverse bot entity fields:" -ForegroundColor DarkGray
+    Write-Host ($propNames -join ', ') -ForegroundColor DarkGray
+    Write-Host ""
 }
 
 # Map of botId -> applicationId (populated from Admin API)
@@ -293,9 +300,16 @@ if ($graphToken) {
             $appResult = Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/applications?`$filter=displayName eq '$escapedName'&`$select=id,displayName,appId&`$top=1" -Headers $graphHeaders -Method Get
             if ($appResult.value -and $appResult.value.Count -gt 0) {
                 $appByNameCache[$botName] = $appResult.value[0]
+                Write-Host "  Matched app registration for '$botName' -> appId: $($appResult.value[0].appId)" -ForegroundColor Gray
+            }
+            else {
+                Write-Host "  No app registration found matching name '$botName'" -ForegroundColor DarkGray
             }
         }
-        catch {}
+        catch {
+            $err = Get-ErrorDetail $_
+            Write-Warning "Graph app lookup for '$botName' failed (HTTP $($err.StatusCode)): $($err.Detail)"
+        }
 
         # Search for service principal by display name
         try {
@@ -304,7 +318,10 @@ if ($graphToken) {
                 $spByNameCache[$botName] = $spResult.value[0]
             }
         }
-        catch {}
+        catch {
+            $err = Get-ErrorDetail $_
+            Write-Warning "Graph SP lookup for '$botName' failed (HTTP $($err.StatusCode)): $($err.Detail)"
+        }
     }
 }
 
