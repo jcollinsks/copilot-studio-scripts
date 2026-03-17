@@ -85,7 +85,7 @@ $headers = @{
 }
 
 # --- Query Bots with Pagination ---
-$selectFields = "botid,name,schemaname,statecode,statuscode,language,createdon,modifiedon"
+$selectFields = "botid,name,schemaname,statecode,statuscode,language,createdon,modifiedon,applicationid"
 $requestUrl = "$EnvironmentUrl/api/data/v9.2/bots?`$select=$selectFields&`$orderby=name"
 
 $allBots = [System.Collections.Generic.List[PSObject]]::new()
@@ -104,17 +104,7 @@ while ($requestUrl) {
 
     if ($response.value) {
         foreach ($bot in $response.value) {
-            $obj = [PSCustomObject]@{
-                Name       = $bot.name
-                BotId      = $bot.botid
-                SchemaName = $bot.schemaname
-                StateCode  = $bot.statecode
-                StatusCode = $bot.statuscode
-                Language   = $bot.language
-                CreatedOn  = $bot.createdon
-                ModifiedOn = $bot.modifiedon
-            }
-            $allBots.Add($obj)
+            $allBots.Add($bot)
         }
     }
 
@@ -122,14 +112,90 @@ while ($requestUrl) {
     $requestUrl = $response.'@odata.nextLink'
 }
 
+# --- Look up Azure AD App Registrations and Service Principals via Microsoft Graph ---
+$graphToken = $null
+try {
+    $graphToken = Get-PlainToken (Get-AzAccessToken -ResourceUrl "https://graph.microsoft.com")
+}
+catch {
+    Write-Warning "Could not acquire Microsoft Graph token. App/Service Principal columns will be empty."
+}
+
+$graphHeaders = @{}
+if ($graphToken) {
+    $graphHeaders = @{
+        Authorization = "Bearer $graphToken"
+        Accept        = "application/json"
+    }
+}
+
+# Build a cache of app registrations and service principals keyed by appId
+$appCache = @{}
+$spCache = @{}
+
+if ($graphToken) {
+    # Collect unique application IDs
+    $appIds = $allBots | Where-Object { $_.applicationid } | ForEach-Object { $_.applicationid } | Sort-Object -Unique
+
+    foreach ($appId in $appIds) {
+        # Look up app registration
+        try {
+            $appResult = Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/applications?`$filter=appId eq '$appId'&`$select=id,displayName,appId" -Headers $graphHeaders -Method Get
+            if ($appResult.value -and $appResult.value.Count -gt 0) {
+                $appCache[$appId] = $appResult.value[0]
+            }
+        }
+        catch {
+            Write-Warning "Could not look up app registration for appId $appId"
+        }
+
+        # Look up service principal
+        try {
+            $spResult = Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/servicePrincipals?`$filter=appId eq '$appId'&`$select=id,displayName,appId" -Headers $graphHeaders -Method Get
+            if ($spResult.value -and $spResult.value.Count -gt 0) {
+                $spCache[$appId] = $spResult.value[0]
+            }
+        }
+        catch {
+            Write-Warning "Could not look up service principal for appId $appId"
+        }
+    }
+}
+
+# --- Build Output Objects ---
+$results = [System.Collections.Generic.List[PSObject]]::new()
+
+foreach ($bot in $allBots) {
+    $appId = $bot.applicationid
+    $app = if ($appId -and $appCache.ContainsKey($appId)) { $appCache[$appId] } else { $null }
+    $sp  = if ($appId -and $spCache.ContainsKey($appId))  { $spCache[$appId] }  else { $null }
+
+    $obj = [PSCustomObject]@{
+        Name               = $bot.name
+        BotId              = $bot.botid
+        SchemaName         = $bot.schemaname
+        StateCode          = $bot.statecode
+        StatusCode         = $bot.statuscode
+        Language           = $bot.language
+        CreatedOn          = $bot.createdon
+        ModifiedOn         = $bot.modifiedon
+        ApplicationId      = $appId
+        AppDisplayName     = if ($app) { $app.displayName } else { $null }
+        AppObjectId        = if ($app) { $app.id } else { $null }
+        ServicePrincipalId = if ($sp) { $sp.id } else { $null }
+        SPDisplayName      = if ($sp) { $sp.displayName } else { $null }
+    }
+    $results.Add($obj)
+}
+
 # --- Output Results ---
-if ($allBots.Count -eq 0) {
+if ($results.Count -eq 0) {
     Write-Host "No Copilot Studio agents found in this environment." -ForegroundColor Yellow
 }
 else {
-    Write-Host "Found $($allBots.Count) agent(s):" -ForegroundColor Green
-    $allBots | Format-Table -Property Name, BotId, SchemaName, StateCode, StatusCode, Language, CreatedOn, ModifiedOn -AutoSize | Out-Host
+    Write-Host "Found $($results.Count) agent(s):" -ForegroundColor Green
+    $results | Format-Table -Property Name, BotId, ApplicationId, AppDisplayName, ServicePrincipalId, StateCode, Language -AutoSize | Out-Host
 }
 
 # Write objects to pipeline for downstream use (Export-Csv, Where-Object, etc.)
-$allBots
+$results
