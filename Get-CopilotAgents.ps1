@@ -225,6 +225,77 @@ if ($environmentId) {
     }
 }
 
+# --- Extract App IDs from botcomponent entity (definitive source) ---
+Write-Host "Querying bot components for Azure AD app registrations..." -ForegroundColor Cyan
+
+$bcUrl = "$EnvironmentUrl/api/data/v9.2/botcomponents?`$select=_bot_botid_value,componenttype,data,schemaname,name&`$orderby=_bot_botid_value"
+while ($bcUrl) {
+    try {
+        $bcResponse = Invoke-RestMethod -Uri $bcUrl -Headers $headers -Method Get
+    }
+    catch {
+        $err = Get-ErrorDetail $_
+        Write-Warning "Could not query botcomponents (HTTP $($err.StatusCode)). $($err.Detail)"
+        break
+    }
+
+    if ($bcResponse.value) {
+        foreach ($bc in $bcResponse.value) {
+            $parentBotId = $bc._bot_botid_value
+            if (-not $parentBotId) { continue }
+            $parentBotId = $parentBotId.ToString().ToLower()
+            # Skip if we already found an app ID for this bot
+            if ($botAppIdMap.ContainsKey($parentBotId)) { continue }
+
+            # Try to parse the 'data' field as JSON and look for app/client ID fields
+            $dataStr = $bc.data
+            if (-not $dataStr) { continue }
+            try {
+                $dataObj = $dataStr | ConvertFrom-Json
+            }
+            catch { continue }
+
+            # Search common field names in the JSON
+            $foundAppId = $null
+            foreach ($field in @('applicationId', 'appId', 'aadApplicationId', 'clientId', 'ApplicationId', 'AppId', 'ClientId', 'msAppId')) {
+                $val = $dataObj.$field
+                if ($val -and $val -match '^[0-9a-fA-F\-]{36}$') {
+                    $foundAppId = $val
+                    break
+                }
+            }
+            # Also check nested 'settings', 'configuration', 'properties' objects
+            if (-not $foundAppId) {
+                foreach ($nested in @('settings', 'configuration', 'properties', 'authenticationConfiguration')) {
+                    $nestedObj = $dataObj.$nested
+                    if (-not $nestedObj) { continue }
+                    foreach ($field in @('applicationId', 'appId', 'clientId', 'ApplicationId', 'AppId', 'ClientId', 'msAppId')) {
+                        $val = $nestedObj.$field
+                        if ($val -and $val -match '^[0-9a-fA-F\-]{36}$') {
+                            $foundAppId = $val
+                            break
+                        }
+                    }
+                    if ($foundAppId) { break }
+                }
+            }
+
+            if ($foundAppId) {
+                $botAppIdMap[$parentBotId] = $foundAppId
+            }
+        }
+    }
+
+    $bcUrl = $bcResponse.'@odata.nextLink'
+}
+
+if ($botAppIdMap.Count -gt 0) {
+    Write-Host "  Found app IDs for $($botAppIdMap.Count) bot(s) from bot components." -ForegroundColor Green
+}
+else {
+    Write-Host "  No app IDs found in bot components." -ForegroundColor Yellow
+}
+
 # --- Look up Azure AD App Registrations and Service Principals via Microsoft Graph ---
 $graphToken = $null
 try {
@@ -242,85 +313,77 @@ if ($graphToken) {
     }
 }
 
-# Build a cache of app registrations and service principals keyed by appId
+# Build caches: appId-based (from botcomponent/Admin API) and name-based (Graph fallback)
 $appCache = @{}
 $spCache = @{}
-# Also build a name-based lookup cache (bot name -> app/sp) for bots without an appId mapping
 $appByNameCache = @{}
 $spByNameCache = @{}
 
 if ($graphToken) {
     Write-Host "Looking up Azure AD app registrations and service principals..." -ForegroundColor Cyan
 
+    # 1. Look up by appId for bots where we have a definitive mapping
     if ($botAppIdMap.Count -gt 0) {
-        Write-Host "  Found $($botAppIdMap.Count) bot-to-app mapping(s) from Admin API." -ForegroundColor Gray
-        # Collect unique application IDs from Admin API map
         $appIds = $botAppIdMap.Values | Sort-Object -Unique
-
         foreach ($appId in $appIds) {
-            # Look up app registration
             try {
                 $appResult = Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/applications?`$filter=appId eq '$appId'&`$select=id,displayName,appId" -Headers $graphHeaders -Method Get
                 if ($appResult.value -and $appResult.value.Count -gt 0) {
                     $appCache[$appId] = $appResult.value[0]
                 }
             }
-            catch {
-                Write-Warning "Could not look up app registration for appId $appId"
-            }
+            catch {}
 
-            # Look up service principal
             try {
                 $spResult = Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/servicePrincipals?`$filter=appId eq '$appId'&`$select=id,displayName,appId" -Headers $graphHeaders -Method Get
                 if ($spResult.value -and $spResult.value.Count -gt 0) {
                     $spCache[$appId] = $spResult.value[0]
                 }
             }
-            catch {
-                Write-Warning "Could not look up service principal for appId $appId"
-            }
+            catch {}
         }
     }
-    else {
-        Write-Host "  No bot-to-app mappings from Admin API. Will search Graph by bot display name." -ForegroundColor Gray
-    }
 
-    # For bots without an Admin API app ID mapping, search Graph by display name
+    # 2. For bots still without an app ID, search Graph using the Copilot Studio naming pattern
     foreach ($bot in $allBots) {
         $botId = $bot.botid.ToString().ToLower()
         if ($botAppIdMap.ContainsKey($botId)) { continue }
         $botName = $bot.name
         if (-not $botName) { continue }
-        # Skip if we already searched this name
-        if ($appByNameCache.ContainsKey($botName) -or $spByNameCache.ContainsKey($botName)) { continue }
+        if ($appByNameCache.ContainsKey($botName)) { continue }
 
-        # Search for app registration by display name
+        # Copilot Studio names app registrations as "BOTNAME (Microsoft Copilot Studio)"
+        $csName = "$botName (Microsoft Copilot Studio)" -replace "'", "''"
         $escapedName = $botName -replace "'", "''"
-        try {
-            $appResult = Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/applications?`$filter=displayName eq '$escapedName'&`$select=id,displayName,appId&`$top=1" -Headers $graphHeaders -Method Get
-            if ($appResult.value -and $appResult.value.Count -gt 0) {
-                $appByNameCache[$botName] = $appResult.value[0]
-                Write-Host "  Matched app registration for '$botName' -> appId: $($appResult.value[0].appId)" -ForegroundColor Gray
+
+        # Try the Copilot Studio naming pattern first, then exact name
+        $found = $false
+        foreach ($searchName in @($csName, $escapedName)) {
+            try {
+                $appResult = Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/applications?`$filter=displayName eq '$searchName'&`$select=id,displayName,appId&`$top=1" -Headers $graphHeaders -Method Get
+                if ($appResult.value -and $appResult.value.Count -gt 0) {
+                    $appByNameCache[$botName] = $appResult.value[0]
+                    Write-Host "  Matched app for '$botName' -> '$($appResult.value[0].displayName)' (appId: $($appResult.value[0].appId))" -ForegroundColor Gray
+                    $found = $true
+                    break
+                }
             }
-            else {
-                Write-Host "  No app registration found matching name '$botName'" -ForegroundColor DarkGray
-            }
+            catch {}
         }
-        catch {
-            $err = Get-ErrorDetail $_
-            Write-Warning "Graph app lookup for '$botName' failed (HTTP $($err.StatusCode)): $($err.Detail)"
+        if (-not $found) {
+            Write-Host "  No app registration found for '$botName'" -ForegroundColor DarkGray
         }
 
-        # Search for service principal by display name
-        try {
-            $spResult = Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/servicePrincipals?`$filter=displayName eq '$escapedName'&`$select=id,displayName,appId&`$top=1" -Headers $graphHeaders -Method Get
-            if ($spResult.value -and $spResult.value.Count -gt 0) {
-                $spByNameCache[$botName] = $spResult.value[0]
+        # Service principal lookup (try same patterns)
+        foreach ($searchName in @($csName, $escapedName)) {
+            try {
+                $spResult = Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/servicePrincipals?`$filter=displayName eq '$searchName'&`$select=id,displayName,appId&`$top=1" -Headers $graphHeaders -Method Get
+                if ($spResult.value -and $spResult.value.Count -gt 0) {
+                    $spByNameCache[$botName] = $spResult.value[0]
+                    break
+                }
             }
-        }
-        catch {
-            $err = Get-ErrorDetail $_
-            Write-Warning "Graph SP lookup for '$botName' failed (HTTP $($err.StatusCode)): $($err.Detail)"
+            catch {}
         }
     }
 }
@@ -332,7 +395,7 @@ foreach ($bot in $allBots) {
     $botId = $bot.botid.ToString().ToLower()
     $botName = $bot.name
 
-    # Try app ID from Admin API map first
+    # Try app ID from botcomponent/Admin API map first
     $appId = if ($botAppIdMap.ContainsKey($botId)) { $botAppIdMap[$botId] } else { $null }
     $app = if ($appId -and $appCache.ContainsKey($appId)) { $appCache[$appId] } else { $null }
     $sp  = if ($appId -and $spCache.ContainsKey($appId))  { $spCache[$appId] }  else { $null }
