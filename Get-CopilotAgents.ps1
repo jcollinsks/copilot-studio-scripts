@@ -26,7 +26,6 @@ param(
     [string]$EnvironmentUrl
 )
 
-Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 # Normalize the environment URL (remove trailing slash)
@@ -77,7 +76,7 @@ while ($requestUrl) {
     }
     catch {
         $statusCode = $_.Exception.Response.StatusCode.value__
-        $detail = $_.ErrorDetails.Message
+        $detail = if ($_.ErrorDetails.Message) { $_.ErrorDetails.Message } else { $_.Exception.Message }
         Write-Error "Dataverse API request failed (HTTP $statusCode). $detail"
         exit 1
     }

@@ -53,7 +53,6 @@ param(
     [switch]$Force
 )
 
-Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 # Normalize the environment URL (remove trailing slash)
@@ -104,7 +103,7 @@ if ($PSCmdlet.ParameterSetName -eq 'ByName') {
     }
     catch {
         $statusCode = $_.Exception.Response.StatusCode.value__
-        $detail = $_.ErrorDetails.Message
+        $detail = if ($_.ErrorDetails.Message) { $_.ErrorDetails.Message } else { $_.Exception.Message }
         Write-Error "Failed to query bots (HTTP $statusCode). $detail"
         exit 1
     }
@@ -140,7 +139,7 @@ else {
             Write-Error "No bot found with ID '$BotId' in environment '$EnvironmentUrl'."
             exit 1
         }
-        $detail = $_.ErrorDetails.Message
+        $detail = if ($_.ErrorDetails.Message) { $_.ErrorDetails.Message } else { $_.Exception.Message }
         Write-Error "Failed to query bot (HTTP $statusCode). $detail"
         exit 1
     }
@@ -227,11 +226,8 @@ if (-not $deleted) {
         Write-Host "Bot '$($botDetails.name)' ($BotId) deleted successfully via PvaDeleteBot." -ForegroundColor Green
     }
     catch {
-        $statusCode = $null
-        $detail = $_.ErrorDetails.Message
-        if ($_.Exception.Response) {
-            $statusCode = $_.Exception.Response.StatusCode.value__
-        }
+        $statusCode = $_.Exception.Response.StatusCode.value__
+        $detail = if ($_.ErrorDetails.Message) { $_.ErrorDetails.Message } else { $_.Exception.Message }
         Write-Error "PvaDeleteBot failed (HTTP $statusCode). $detail"
         exit 1
     }
