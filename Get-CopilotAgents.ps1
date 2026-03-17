@@ -28,6 +28,15 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# Helper: extract plain-text token from Get-AzAccessToken (handles both old string and new SecureString formats)
+function Get-PlainToken {
+    param([object]$TokenResult)
+    if ($TokenResult.Token -is [System.Security.SecureString]) {
+        return $TokenResult.Token | ConvertFrom-SecureString -AsPlainText
+    }
+    return $TokenResult.Token
+}
+
 # Normalize the environment URL (remove trailing slash)
 $EnvironmentUrl = $EnvironmentUrl.TrimEnd('/')
 
@@ -49,7 +58,7 @@ catch {
 # --- Get Access Token for Dataverse ---
 try {
     $tokenResult = Get-AzAccessToken -ResourceUrl $EnvironmentUrl
-    $accessToken = $tokenResult.Token
+    $accessToken = Get-PlainToken $tokenResult
 }
 catch {
     Write-Error "Failed to acquire access token for '$EnvironmentUrl'. Ensure you have permissions to this environment. Error: $_"

@@ -55,6 +55,15 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# Helper: extract plain-text token from Get-AzAccessToken (handles both old string and new SecureString formats)
+function Get-PlainToken {
+    param([object]$TokenResult)
+    if ($TokenResult.Token -is [System.Security.SecureString]) {
+        return $TokenResult.Token | ConvertFrom-SecureString -AsPlainText
+    }
+    return $TokenResult.Token
+}
+
 # Normalize the environment URL (remove trailing slash)
 $EnvironmentUrl = $EnvironmentUrl.TrimEnd('/')
 
@@ -76,7 +85,7 @@ catch {
 # --- Get Access Token for Dataverse ---
 try {
     $tokenResult = Get-AzAccessToken -ResourceUrl $EnvironmentUrl
-    $dataverseToken = $tokenResult.Token
+    $dataverseToken = Get-PlainToken $tokenResult
 }
 catch {
     Write-Error "Failed to acquire access token for '$EnvironmentUrl'. Ensure you have permissions to this environment. Error: $_"
@@ -190,7 +199,7 @@ if ($EnvironmentId) {
     Write-Host "Attempting deletion via Power Platform Admin API..." -ForegroundColor Cyan
 
     try {
-        $ppToken = (Get-AzAccessToken -ResourceUrl "https://api.powerplatform.com").Token
+        $ppToken = Get-PlainToken (Get-AzAccessToken -ResourceUrl "https://api.powerplatform.com")
         $ppHeaders = @{
             Authorization = "Bearer $ppToken"
             Accept        = "application/json"
