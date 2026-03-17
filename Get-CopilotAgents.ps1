@@ -87,7 +87,7 @@ $headers = @{
 }
 
 # --- Query Bots with Pagination ---
-$selectFields = "botid,name,schemaname,statecode,statuscode,language,createdon,modifiedon,applicationid"
+$selectFields = "botid,name,schemaname,statecode,statuscode,language,createdon,modifiedon"
 $requestUrl = "$EnvironmentUrl/api/data/v9.2/bots?`$select=$selectFields&`$orderby=name"
 
 $allBots = [System.Collections.Generic.List[PSObject]]::new()
@@ -113,6 +113,9 @@ while ($requestUrl) {
     # Follow pagination link if present
     $requestUrl = $response.'@odata.nextLink'
 }
+
+# Map of botId -> applicationId (populated from Admin API)
+$botAppIdMap = @{}
 
 # --- Query Power Platform Admin API for system/demo bots ---
 # Resolve environment ID from Dataverse
@@ -149,24 +152,33 @@ if ($environmentId) {
             if ($b.botid) { $existingBotIds[$b.botid] = $true }
         }
 
-        $adminBotCount = 0
+        # Map bot IDs to application IDs from Admin API (used to enrich Dataverse results too)
         $adminBots = if ($adminResponse.value) { $adminResponse.value } else { @() }
+        foreach ($adminBot in $adminBots) {
+            $abId = $adminBot.botId
+            if (-not $abId) { $abId = $adminBot.id }
+            $abAppId = $adminBot.applicationId
+            if ($abId -and $abAppId) {
+                $botAppIdMap[$abId] = $abAppId
+            }
+        }
+
+        $adminBotCount = 0
         foreach ($adminBot in $adminBots) {
             $adminBotId = $adminBot.botId
             if (-not $adminBotId) { $adminBotId = $adminBot.id }
             if ($adminBotId -and -not $existingBotIds.ContainsKey($adminBotId)) {
                 # Create a normalized object that matches the Dataverse shape
                 $syntheticBot = [PSCustomObject]@{
-                    botid         = $adminBotId
-                    name          = if ($adminBot.displayName) { $adminBot.displayName } else { $adminBot.name }
-                    schemaname    = $adminBot.schemaName
-                    statecode     = $adminBot.state
-                    statuscode    = $adminBot.statusCode
-                    language      = $adminBot.language
-                    createdon     = $adminBot.createdOn
-                    modifiedon    = $adminBot.modifiedOn
-                    applicationid = $adminBot.applicationId
-                    Source        = 'AdminAPI'
+                    botid      = $adminBotId
+                    name       = if ($adminBot.displayName) { $adminBot.displayName } else { $adminBot.name }
+                    schemaname = $adminBot.schemaName
+                    statecode  = $adminBot.state
+                    statuscode = $adminBot.statusCode
+                    language   = $adminBot.language
+                    createdon  = $adminBot.createdOn
+                    modifiedon = $adminBot.modifiedOn
+                    Source     = 'AdminAPI'
                 }
                 $allBots.Add($syntheticBot)
                 $adminBotCount++
@@ -205,8 +217,8 @@ $appCache = @{}
 $spCache = @{}
 
 if ($graphToken) {
-    # Collect unique application IDs
-    $appIds = $allBots | Where-Object { $_.applicationid } | ForEach-Object { $_.applicationid } | Sort-Object -Unique
+    # Collect unique application IDs from Admin API map
+    $appIds = $botAppIdMap.Values | Sort-Object -Unique
 
     foreach ($appId in $appIds) {
         # Look up app registration
@@ -237,7 +249,7 @@ if ($graphToken) {
 $results = [System.Collections.Generic.List[PSObject]]::new()
 
 foreach ($bot in $allBots) {
-    $appId = $bot.applicationid
+    $appId = if ($botAppIdMap.ContainsKey($bot.botid)) { $botAppIdMap[$bot.botid] } else { $null }
     $app = if ($appId -and $appCache.ContainsKey($appId)) { $appCache[$appId] } else { $null }
     $sp  = if ($appId -and $spCache.ContainsKey($appId))  { $spCache[$appId] }  else { $null }
 
