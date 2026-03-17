@@ -4,7 +4,9 @@
 
 .DESCRIPTION
     Authenticates via Connect-AzAccount and queries the Dataverse Web API to retrieve
-    all Copilot Studio agents. Handles pagination automatically.
+    all Copilot Studio agents. Also queries the Power Platform Admin API to include
+    system-generated and demo bots that Microsoft provisions. Handles pagination
+    automatically.
 
 .PARAMETER EnvironmentUrl
     The Dataverse environment URL (e.g., https://yourorg.crm.dynamics.com).
@@ -112,6 +114,75 @@ while ($requestUrl) {
     $requestUrl = $response.'@odata.nextLink'
 }
 
+# --- Query Power Platform Admin API for system/demo bots ---
+# Resolve environment ID from Dataverse
+$environmentId = $null
+try {
+    $orgUrl = "$EnvironmentUrl/api/data/v9.2/organizations?`$select=organizationid,environmentid"
+    $orgResponse = Invoke-RestMethod -Uri $orgUrl -Headers $headers -Method Get
+    if ($orgResponse.value -and $orgResponse.value.Count -gt 0) {
+        $environmentId = $orgResponse.value[0].environmentid
+        if (-not $environmentId) {
+            $environmentId = $orgResponse.value[0].organizationid
+        }
+    }
+}
+catch {
+    Write-Warning "Could not resolve environment ID. System/demo bots may not be included."
+}
+
+if ($environmentId) {
+    Write-Host "Querying Power Platform Admin API for system/demo bots..." -ForegroundColor Cyan
+    try {
+        $ppToken = Get-PlainToken (Get-AzAccessToken -ResourceUrl "https://api.powerplatform.com")
+        $ppHeaders = @{
+            Authorization = "Bearer $ppToken"
+            Accept        = "application/json"
+        }
+
+        $adminBotsUrl = "https://api.powerplatform.com/copilotstudio/environments/$environmentId/bots?api-version=2022-03-01-preview"
+        $adminResponse = Invoke-RestMethod -Uri $adminBotsUrl -Headers $ppHeaders -Method Get
+
+        # Collect bot IDs already found via Dataverse
+        $existingBotIds = @{}
+        foreach ($b in $allBots) {
+            if ($b.botid) { $existingBotIds[$b.botid] = $true }
+        }
+
+        $adminBotCount = 0
+        $adminBots = if ($adminResponse.value) { $adminResponse.value } else { @() }
+        foreach ($adminBot in $adminBots) {
+            $adminBotId = $adminBot.botId
+            if (-not $adminBotId) { $adminBotId = $adminBot.id }
+            if ($adminBotId -and -not $existingBotIds.ContainsKey($adminBotId)) {
+                # Create a normalized object that matches the Dataverse shape
+                $syntheticBot = [PSCustomObject]@{
+                    botid         = $adminBotId
+                    name          = if ($adminBot.displayName) { $adminBot.displayName } else { $adminBot.name }
+                    schemaname    = $adminBot.schemaName
+                    statecode     = $adminBot.state
+                    statuscode    = $adminBot.statusCode
+                    language      = $adminBot.language
+                    createdon     = $adminBot.createdOn
+                    modifiedon    = $adminBot.modifiedOn
+                    applicationid = $adminBot.applicationId
+                    Source        = 'AdminAPI'
+                }
+                $allBots.Add($syntheticBot)
+                $adminBotCount++
+            }
+        }
+
+        if ($adminBotCount -gt 0) {
+            Write-Host "Found $adminBotCount additional bot(s) from Admin API (system/demo)." -ForegroundColor Green
+        }
+    }
+    catch {
+        $err = Get-ErrorDetail $_
+        Write-Warning "Power Platform Admin API query failed (HTTP $($err.StatusCode)). System/demo bots may not be included. $($err.Detail)"
+    }
+}
+
 # --- Look up Azure AD App Registrations and Service Principals via Microsoft Graph ---
 $graphToken = $null
 try {
@@ -170,6 +241,7 @@ foreach ($bot in $allBots) {
     $app = if ($appId -and $appCache.ContainsKey($appId)) { $appCache[$appId] } else { $null }
     $sp  = if ($appId -and $spCache.ContainsKey($appId))  { $spCache[$appId] }  else { $null }
 
+    $source = if ($bot.Source -eq 'AdminAPI') { 'AdminAPI' } else { 'Dataverse' }
     $obj = [PSCustomObject]@{
         Name               = $bot.name
         BotId              = $bot.botid
@@ -184,6 +256,7 @@ foreach ($bot in $allBots) {
         AppObjectId        = if ($app) { $app.id } else { $null }
         ServicePrincipalId = if ($sp) { $sp.id } else { $null }
         SPDisplayName      = if ($sp) { $sp.displayName } else { $null }
+        Source             = $source
     }
     $results.Add($obj)
 }
@@ -194,7 +267,7 @@ if ($results.Count -eq 0) {
 }
 else {
     Write-Host "Found $($results.Count) agent(s):" -ForegroundColor Green
-    $results | Format-Table -Property Name, BotId, ApplicationId, AppDisplayName, ServicePrincipalId, StateCode, Language -AutoSize | Out-Host
+    $results | Format-Table -Property Name, BotId, ApplicationId, AppDisplayName, ServicePrincipalId, StateCode, Language, Source -AutoSize | Out-Host
 }
 
 # Write objects to pipeline for downstream use (Export-Csv, Where-Object, etc.)
